@@ -1,0 +1,280 @@
+name: CI
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, development]
+    # ignore when git tags are pushed
+    tags-ignore: ["**"]
+  pull_request:
+    branches: [main, development]
+concurrency:
+  # Cancel any existing workflow run that is in progress if a new run is triggered with the same run ID
+  # See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+env:
+  # Emulate a production build
+  ENVIRONMENT_NAME: "production"
+  IS_PROTECTED_BRANCH: ${{ github.ref == 'refs/heads/development' || github.ref == 'refs/heads/main' }}
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+        with:
+          # See https://yarnpkg.com/features/release-workflow#commit-history
+          fetch-depth: ${{ env.IS_PROTECTED_BRANCH }}
+
+      - name: Use Node 14
+        uses: actions/setup-node@v2
+        with:
+          node-version: 14
+          cache: yarn
+
+#       - name: Install git-secret
+#         run: |
+#           sudo apt-get update
+#           sudo apt-get install git-secret -y
+#           git secret --version
+
+#       - name: Decode secret files
+#         run: |
+#           echo -n "$GPG_PRIVATE_KEY" | gpg --import
+#           git secret reveal
+#         env:
+#           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Install dependencies
+        run: yarn --immutable
+
+        # Retrieve a list of version files that were deleted in the PR
+      - name: Get deleted version files
+        id: getVersionFiles
+        # Only run this step when NOT on the development or main branch
+        if: ${{ !env.IS_PROTECTED_BRANCH }}
+        # Set outputs using the GitHub action '::set-output' command
+        run: |
+          echo "::set-output name=deleted::$(git diff --name-only --diff-filter=D ${{ github.event.pull_request.base.sha }} ${{ github.sha }} -- .yarn/versions | xargs)"
+
+      - name: Check semantic versions
+        # Only run this step when NOT on the development or main branch AND no version files were applied (aka deleted)
+        # There is currently a bug in "yarn version check" that throws the error "UsageError: Your current branch contains multiple versioning files; this isn't supported"
+        #  if there are multiple deleted version files
+        if: ${{ !env.IS_PROTECTED_BRANCH && !steps.getVersionFiles.outputs.deleted }}
+        run: yarn version check
+
+      - name: Validate Github Actions YAML Schema Validator
+        # Only run this step when NOT on the development or main branch
+        if: ${{ !env.IS_PROTECTED_BRANCH }}
+        uses: nwisbeta/validate-yaml-schema@v1.0.3
+        with:
+          settingsFile: .vscode/settings.json
+
+      - name: Check Typescript
+        run: yarn type-check:all
+
+      # The lint step must be after the type check step so the *.d.ts files exist
+      - name: Lint
+        run: yarn lint
+        env:
+          NODE_OPTIONS: "--max-old-space-size=4096"
+
+      # See https://nextjs.org/docs/messages/no-cache#github-actions
+      - name: Restore NextJS Build Cache
+        uses: actions/cache@v2
+        env:
+          cache-name: next-js-cache
+        with:
+          path: packages/web-app/.next/cache
+          # Generate a new cache whenever packages or source files change.
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('packages/web-app/src/package.json') }}-${{ hashFiles('packages/web-app/src/**.[jt]sx?') }}
+          # If source files changed but packages didn't, rebuild from a prior cache.
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('packages/web-app/src/package.json') }}-
+
+      - name: Build all projects
+        run: yarn build
+        env:
+          # Since we just performed type checking we can skip it in the build step
+          SKIP_NEXTJS_TYPE_CHECKING: "true"
+
+      # The tests must be ran after the build so any cross-workspace dependencies can resolve
+      - name: Test
+        run: yarn test --ci --coverage --maxWorkers=2
+
+      - name: Upload code coverage results
+        # Only run this step when on the development or main branch
+        if: ${{ env.IS_PROTECTED_BRANCH }}
+        uses: actions/upload-artifact@v2
+        with:
+          name: test-coverage
+          path: coverage
+          retention-days: 30
+          if-no-files-found: error
+
+  # TODO(bryant): Disabling sonarqube run due to sonarqube being down.
+  # - name: SonarQube Scan
+  #   if: github.ref == 'refs/heads/development'
+  #   uses: kitabisa/sonarqube-action@v1.1.0
+  #   with:
+  #     host: ${{ secrets.SONARQUBE_HOST }}
+  #     login: ${{ secrets.SONARQUBE_TOKEN }}
+
+  cypress-test:
+    name: Run Cypress
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        #create individual jobs for each cypress test to allow tests to execute in parallel
+        containers:
+          [
+            #NOTE:These tests are temporarily disabled for analysis, they will be eliminated depending on the SPIKE WEBAPP-2333
+#             asset_hub/gated_asset_landing_page,
+#             asset_hub/asset_hub_categories,
+#             asset_hub/asset_hub_email_verification,
+#             #content_hub/category_product,
+#             content_hub/content_hub_home,
+#             #content_hub/topic_data_visualization,
+#             customer_stories/customer_story_homepage,
+#             enterprise/enterprise_home,
+#             enterprise/enterprise_services,
+#             # guides/landing/highlight_key_details_with_the_record_summary_layout,
+#             # guides/landing/onboarding_your_team_to_airtable,
+#             # guides/landing/report_on_metrics_with_a_dashboard_layout,
+#             # guides/landing/simplify_collaboration_with_the_record_review_layout,
+#             # guides/landing/your_guide_to_designing_an_interface,
+#             guides/guides_home,
+#             header/product/features,
+#             header/product/product,
+#             header/solution/by_teams,
+#             header/solution/by_use_case,
+#             header/solution/solution,
+#             header/enterprise_header,
+#             header/header,
+#             header/resource_header,
+#             #footer,
+#             privacy,
+#             solutions,
+              sample,
+              sample2
+          ]
+
+          # Only run this job if the "skip-cypress" label isn't used on the PR
+    if: ${{ github.event.pull_request && !contains(github.event.pull_request.labels.*.name, 'skip-cypress') }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+
+      - name: Add Host
+        run: |
+          sudo echo "127.0.0.1       localhost" | sudo tee -a /etc/hosts
+          sudo echo "255.255.255.255       broadcasthost" | sudo tee -a /etc/hosts
+          sudo echo "::1      localhost" | sudo tee -a /etc/hosts
+          sudo echo "127.0.0.1       hyperbasedev.com" | sudo tee -a /etc/hosts
+          sudo echo "127.0.0.1       www.hyperbasedev.com" | sudo tee -a /etc/hosts
+
+      - name: Use Node 14
+        uses: actions/setup-node@v2
+        with:
+          node-version: 14
+          cache: yarn
+
+#       - name: Decode secret files
+#         run: |
+#           sudo apt-get update
+#           sudo apt-get install git-secret -y
+#           echo -n "$GPG_PRIVATE_KEY" | gpg --import
+#           git secret reveal
+#         env:
+#           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+      - name: Install dependencies
+        run: yarn --immutable
+
+      # See https://nextjs.org/docs/messages/no-cache#github-actions
+      - name: Restore NextJS Build Cache
+        uses: actions/cache@v2
+        env:
+          cache-name: next-js-cache
+        with:
+          path: packages/web-app/.next/cache
+          # Generate a new cache whenever packages or source files change.
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('packages/web-app/src/package.json') }}-${{ hashFiles('packages/web-app/src/**.[jt]sx?') }}
+          # If source files changed but packages didn't, rebuild from a prior cache.
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('packages/web-app/src/package.json') }}-
+
+      - name: Build libraries
+        run: yarn build:libraries
+
+      # Running Cypress Test
+      - name: Cypress run
+        uses: cypress-io/github-action@v2
+        env:
+          PORT: 8080
+        with:
+          start: yarn workspace @hyperbase/web-app dev:cypress
+          wait-on: "https://www.hyperbasedev.com:8080"
+          command: yarn workspace @hyperbase/web-app cypress:single cypress/e2e/${{ matrix.containers }}.spec.ts
+
+      - name: Save Cypress Screenshots
+        uses: actions/upload-artifact@v2
+        if: failure()
+        with:
+          name: cypress-screenshots
+          path: packages/web-app/cypress/screenshots
+
+      # Test run video was always captured, so this action uses "always()" condition
+      - name: Save Cypress Videos
+        uses: actions/upload-artifact@v2
+        if: always()
+        with:
+          name: cypress-videos
+          path: packages/web-app/cypress/videos
+
+#   create-review-app:
+#     name: Create Review App
+#     runs-on: ubuntu-latest
+#     if: ${{ github.event.pull_request && contains(github.event.pull_request.labels.*.name, 'review-app') }}
+#     env:
+#       # Emulate a dev build
+#       ENVIRONMENT_NAME: "local"
+#     steps:
+#       - name: Checkout repo
+#         uses: actions/checkout@v2
+
+#       - name: Use Node 14
+#         uses: actions/setup-node@v2
+#         with:
+#           node-version: 14
+#           cache: yarn
+
+# #       - name: Install git-secret
+# #         run: |
+# #           sudo apt-get update
+# #           sudo apt-get install git-secret -y
+# #           echo "Listing all possible git-secret versions"
+# #           sudo apt list -a git-secret
+
+# #       # Heroku isn't able to decode the secret files so we do that in a step prior to uploading to Heroku
+# #       - name: Decode secret files
+# #         run: |
+# #           echo -n "$GPG_PRIVATE_KEY" | gpg --import
+# #           git secret reveal
+# #         env:
+# #           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+#       - name: Install dependencies for create-review-app action
+#         working-directory: ./.github/actions/create-review-app
+#         run: yarn --immutable
+
+#       - name: Create review app
+#         uses: ./.github/actions/create-review-app
+#         with:
+#           github-token: ${{ github.token }}
+#           heroku-pipeline-id: "db5f0ecc-f573-43eb-9e5c-acf551ffc220" # airtable-marketing-pipeline
+#           heroku-access-token: ${{ secrets.HEROKU_API_KEY }}
